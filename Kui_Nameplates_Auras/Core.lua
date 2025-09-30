@@ -9,6 +9,8 @@ local addon = LibStub("AceAddon-3.0"):GetAddon("KuiNameplates")
 local spelllist = LibStub("KuiSpellList-1.0")
 local kui = LibStub("Kui-1.0")
 local mod = addon:NewModule("Auras", addon.Prototype, "AceEvent-3.0")
+-- module-level cache for combat-log auras on secondary targets
+mod.cl_cache = mod.cl_cache or {}
 local L = LibStub("AceLocale-3.0"):GetLocale("KuiNameplatesAuras")
 local whitelist, namedlist, _
 
@@ -67,6 +69,35 @@ local function UpdateSizes()
 	sizes.trivial_container_width = (sizes.tauraWidth * trivial_num_per_column) + (1 * (trivial_num_per_column - 1))
 	sizes.trivial_container_offset = (trivial_width - sizes.trivial_container_width) / 2
 end
+-- cache helpers ---------------------------------------------------------------
+local function CacheAuraAddition(destGUID, spellid, spellname)
+    if not destGUID or not (spellid or spellname) then return end
+    local cache = mod.cl_cache
+    cache[destGUID] = cache[destGUID] or {}
+    local sid = spellid or (namedlist and (namedlist[spellname] or namedlist[strlower(spellname)]))
+    if not sid then return end
+    cache[destGUID][sid] = { name = spellname, added = GetTime() }
+end
+local function CacheAuraRemoval(destGUID, spellid, spellname)
+    if not destGUID then return end
+    local root = mod.cl_cache
+    local cache = root[destGUID]
+    if not cache then return end
+    if spellid and cache[spellid] then cache[spellid] = nil end
+    if spellname then
+        local sid = (namedlist and (namedlist[spellname] or namedlist[strlower(spellname)]))
+        if sid and cache[sid] then cache[sid] = nil end
+    end
+    if not next(cache) then root[destGUID] = nil end
+end
+local function ApplyCachedAurasToFrame(frame, guid)
+    if not frame or not frame.auras or not guid then return end
+    local cache = mod.cl_cache[guid]
+    if not cache then return end
+    for sid, info in pairs(cache) do
+        frame.auras:DisplayAura(sid, info.name, select(3, GetSpellInfo(sid)), 1, nil, nil, db_behav and db_behav.alwaysShowMine)
+    end
+end
 local function UpdateButtonSize(self, button)
 	-- Set size of an aura icon
 	-- Used whenever a button is requested to be shown
@@ -115,6 +146,9 @@ end
 -- stored spell id durations
 -- used for giving timers to aura icons when they're added by the combat log
 local stored_spells = {}
+
+-- combat log cache of auras by destGUID, used for secondary targets
+-- cache stored on module (mod.cl_cache)
 
 local function ArrangeButtons(self)
 	local pv, pc
@@ -383,7 +417,7 @@ local function GetAuraButton(self, spellid, icon, count, duration, expirationTim
 
 	return button
 end
-local function DisplayAura(self, spellid, name, icon, count, duration, expirationTime)
+local function DisplayAura(self, spellid, name, icon, count, duration, expirationTime, is_mine)
 	if not spellid then
 		return
 	end
@@ -392,7 +426,8 @@ local function DisplayAura(self, spellid, name, icon, count, duration, expiratio
 		return
 	end
 
-	if db_behav.useWhitelist and not (whitelist[spellid] or whitelist[name] or namedlist[name]) then
+	local lname = strlower(name)
+	if db_behav.useWhitelist and not is_mine and not (whitelist[spellid] or whitelist[name] or whitelist[lname] or namedlist[name] or namedlist[lname]) then
 		-- not in whitelist
 		return
 	end
@@ -401,6 +436,7 @@ local function DisplayAura(self, spellid, name, icon, count, duration, expiratio
 	if not duration then
 		duration = stored_spells[spellid]
 
+		-- placeholder removed
 		if duration then
 			expirationTime = GetTime() + duration
 		end
@@ -464,7 +500,7 @@ function mod:COMBAT_LOG_EVENT_UNFILTERED(_, castTime, event, guid, name, _, dest
 	-- to detect aura updates on the mouseover, if it exists
 	-- (since UNIT_AURA doesn't fire for mouseover)
 	-- and place auras on frames for which GUIDs are known, if possible
-	if not guid and guid ~= PLAYER_GUID then
+	if not guid or guid ~= PLAYER_GUID then
 		return
 	end
 
@@ -487,7 +523,8 @@ function mod:COMBAT_LOG_EVENT_UNFILTERED(_, castTime, event, guid, name, _, dest
 		if not f or not f.auras then
 			return
 		end
-		if (f.trivial and not self.db.profile.showtrivial) or f.friend then
+		-- allow auras on trivial enemy units (only filter out friendlies)
+		if f.friend then
 			return
 		end
 
@@ -497,56 +534,73 @@ function mod:COMBAT_LOG_EVENT_UNFILTERED(_, castTime, event, guid, name, _, dest
 
 		if REMOVAL_EVENTS[event] then
 			-- hide an aura button when the combat log reports it has expired
-			local btn = f.auras.spellids[spellid] or f.auras.spellids[namedlist[spellname]]
+			local btn = f.auras.spellids[spellid] or f.auras.spellids[namedlist[spellname]] or f.auras.spellids[namedlist[strlower(spellname)]]
 			if btn then
 				btn:Hide()
 			end
 		elseif ADDITION_EVENTS[event] then
-			local btn = f.auras.spellids[spellid] or f.auras.spellids[namedlist[spellname]]
+			local btn = f.auras.spellids[spellid] or f.auras.spellids[namedlist[spellname]] or f.auras.spellids[namedlist[strlower(spellname)]]
 			if btn then
 				-- reset timer to original duration
 				UpdateButtonDuration(btn, stored_spells[spellid])
 			else
 				-- show a placeholder button with no timer when possible
-				f.auras:DisplayAura(spellid, spellname, select(3, GetSpellInfo(spellid)), 1)
+				f.auras:DisplayAura(spellid, spellname, select(3, GetSpellInfo(spellid)), 1, nil, nil, db_behav and db_behav.alwaysShowMine)
 			end
 		end
 	end
 end
 function mod:PostTarget(msg, frame, is_target)
-	if is_target then
-		self:UNIT_AURA("UNIT_AURA", "target")
-	end
+    if is_target then
+        self:UNIT_AURA("UNIT_AURA", "target")
+        -- also apply cached auras for target (in case CL fired before plate appeared)
+        if db_behav.showSecondary and frame and not frame.friend then
+            ApplyCachedAurasToFrame(frame, UnitGUID("target"))
+        end
+    end
 end
 function mod:UPDATE_MOUSEOVER_UNIT()
-	self:UNIT_AURA("UNIT_AURA", "mouseover")
+    self:UNIT_AURA("UNIT_AURA", "mouseover")
+    -- apply cached auras for mouseover
+    if db_behav.showSecondary then
+        local f = addon:GetNameplate(UnitGUID("mouseover"))
+        if f and not f.friend then
+            ApplyCachedAurasToFrame(f, UnitGUID("mouseover"))
+        end
+    end
 end
 function mod:GUIDStored(msg, f, unit)
 	self:UNIT_AURA("UNIT_AURA", unit, f)
+    -- also apply any cached auras for this GUID (secondary target support)
+    if db_behav.showSecondary and f and not f.friend then
+        ApplyCachedAurasToFrame(f, UnitGUID(unit))
+    end
 end
 function mod:UNIT_AURA(event, unit, frame)
 	-- select the unit's nameplate
-	--unit = 'target' -- DEBUG
 	frame = frame or addon:GetNameplate(UnitGUID(unit))
 	if not frame or not frame.auras then
 		return
 	end
-	if frame.trivial and not self.db.profile.showtrivial then
-		return
-	end
 
 	local filter = "PLAYER"
-	if UnitIsFriend(unit, "player") then
+	local is_friend = UnitIsFriend(unit, "player")
+	if is_friend then
 		filter = filter .. "|HELPFUL"
 	else
 		filter = filter .. "|HARMFUL"
+	end
+
+	if frame.trivial and not self.db.profile.showtrivial and is_friend then
+		-- when showtrivial is disabled, still show harmful auras on trivial enemies
+		return
 	end
 
 	for i = 1, 40 do
 		local name, _, icon, count, _, duration, expirationTime, _, _, _, spellid = UnitAura(unit, i, filter)
 
 		if spellid then
-			frame.auras:DisplayAura(spellid, name, icon, count, duration, expirationTime)
+			frame.auras:DisplayAura(spellid, name, icon, count, duration, expirationTime, db_behav and db_behav.alwaysShowMine)
 		else
 			break -- nothing found
 		end
@@ -569,7 +623,21 @@ function mod:WhitelistChanged()
 	whitelist = spelllist.GetImportantSpells(select(2, UnitClass("player")))
 	namedlist = {}
 	for spellid, _ in pairs(whitelist) do
-		namedlist[GetSpellInfo(spellid)] = spellid
+		local sname
+		if type(spellid) == "number" then
+			sname = GetSpellInfo(spellid)
+			if sname then
+				namedlist[sname] = spellid
+				namedlist[strlower(sname)] = spellid
+			end
+		elseif type(spellid) == "string" then
+			-- custom verbatim entries
+			sname = GetSpellInfo(spellid) or spellid
+			namedlist[sname] = spellid
+			namedlist[strlower(sname)] = spellid
+			namedlist[spellid] = spellid
+			namedlist[strlower(spellid)] = spellid
+		end
 	end
 end
 ---------------------------------------------------- Post db change functions --
